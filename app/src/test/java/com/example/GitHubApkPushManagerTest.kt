@@ -20,6 +20,9 @@ import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.io.FileOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -229,5 +232,83 @@ class GitHubApkPushManagerTest {
         val success = res as GitHubPushResult.Success
         assertTrue(success.workflowDispatched)
         assertEquals("https://github.com/builder/my-apk-app/actions/runs/99", success.actionsUrl)
+    }
+
+    @Test
+    fun pushSourceAndBuildApk_supportsZipSourceAndUnwrapsSingleRootFolder() = runTest {
+        val zipFile = tempFolder.newFile("pydroid3-source-code.zip")
+        ZipOutputStream(FileOutputStream(zipFile)).use { zos ->
+            fun putFile(entryName: String, content: String) {
+                zos.putNextEntry(ZipEntry(entryName))
+                zos.write(content.toByteArray(Charsets.UTF_8))
+                zos.closeEntry()
+            }
+            putFile("SampleRepo-main/build.gradle.kts", "// gradle root\n")
+            putFile("SampleRepo-main/app/src/MainActivity.kt", "class MainActivity\n")
+            putFile("SampleRepo-main/build/generated/ignored.txt", "skip build artifact")
+            putFile("SampleRepo-main/.git/HEAD", "ref: refs/heads/main")
+            putFile("__MACOSX/._SampleRepo-main", "mac metadata")
+        }
+
+        var uploadedTreeContent = ""
+        val seenPaths = mutableListOf<String>()
+        val storage = InMemoryTokenStorage()
+        val manager = GitHubApkPushManager(
+            storage = storage,
+            client = fakeClient { req ->
+                val path = req.url.encodedPath
+                seenPaths.add("${req.method} $path")
+                when {
+                    req.method == "GET" && path == "/user" ->
+                        200 to """{"login":"builder","name":"Builder","avatar_url":""}"""
+                    req.method == "GET" && path == "/repos/builder/samplerepo" ->
+                        404 to """{"message":"Not Found"}"""
+                    req.method == "POST" && path == "/user/repos" ->
+                        201 to """{"name":"samplerepo","default_branch":"main"}"""
+                    req.method == "GET" && path == "/repos/builder/samplerepo/git/ref/heads/main" ->
+                        200 to """{"object":{"sha":"basecommitsha111"}}"""
+                    req.method == "POST" && path == "/repos/builder/samplerepo/git/blobs" ->
+                        201 to """{"sha":"blobsha_${seenPaths.size}"}"""
+                    req.method == "POST" && path == "/repos/builder/samplerepo/git/trees" -> {
+                        val buffer = okio.Buffer()
+                        req.body?.writeTo(buffer)
+                        uploadedTreeContent = buffer.readUtf8()
+                        201 to """{"sha":"treesha_zip_999"}"""
+                    }
+                    req.method == "POST" && path == "/repos/builder/samplerepo/git/commits" ->
+                        201 to """{"sha":"commitsha_zip_888"}"""
+                    req.method == "PATCH" && path == "/repos/builder/samplerepo/git/refs/heads/main" ->
+                        200 to """{"ref":"refs/heads/main"}"""
+                    req.method == "POST" && path == "/repos/builder/samplerepo/actions/workflows/android.yml/dispatches" ->
+                        204 to ""
+                    req.method == "GET" && path == "/repos/builder/samplerepo/actions/runs" ->
+                        200 to """{"total_count":1,"workflow_runs":[{"id":77,"status":"queued","html_url":"https://github.com/builder/samplerepo/actions/runs/77"}]}"""
+                    else -> 404 to """{"message":"Unhandled route $path"}"""
+                }
+            }
+        )
+
+        val res = manager.pushSourceAndBuildApk(
+            rawToken = "ghp_good_token_zip_123",
+            sourceDir = zipFile,
+            rawRepoName = "samplerepo"
+        )
+
+        assertTrue("Expected Success but got $res", res is GitHubPushResult.Success)
+        val success = res as GitHubPushResult.Success
+        assertEquals("builder/samplerepo", success.repoFullName)
+        assertEquals("https://github.com/builder/samplerepo/actions/runs/77", success.actionsUrl)
+        assertEquals(3, success.uploadedFilesCount) // build.gradle.kts, app/src/MainActivity.kt, .github/workflows/android.yml
+        assertTrue(success.workflowDispatched)
+
+        val treeArray = JSONObject(uploadedTreeContent).getJSONArray("tree")
+        val uploadedPaths = (0 until treeArray.length()).map { idx ->
+            treeArray.getJSONObject(idx).getString("path")
+        }
+        assertTrue(uploadedPaths.contains("build.gradle.kts"))
+        assertTrue(uploadedPaths.contains("app/src/MainActivity.kt"))
+        assertTrue(uploadedPaths.contains(".github/workflows/android.yml"))
+        assertFalse(uploadedPaths.any { it.startsWith("SampleRepo-main/") })
+        assertFalse(uploadedPaths.any { it.contains("ignored.txt") || it.contains(".git/") || it.contains("__MACOSX") })
     }
 }

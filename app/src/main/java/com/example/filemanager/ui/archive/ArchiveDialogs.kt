@@ -1,5 +1,16 @@
 package com.example.filemanager.ui.archive
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.OpenableColumns
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -26,10 +37,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.ContextCompat
 import com.example.filemanager.archive.*
+import com.example.filemanager.model.FileItem
 import com.example.filemanager.utils.FileOperations
 import com.example.ui.theme.*
 import java.io.File
+import java.io.FileOutputStream
 import java.security.SecureRandom
 
 /**
@@ -614,26 +628,95 @@ fun CreateArchiveDialog(
 fun FolderPickerDialog(
     title: String,
     initialDir: File,
+    showZipFiles: Boolean = false,
     onDismiss: () -> Unit,
     onFolderSelected: (File) -> Unit
 ) {
     val context = LocalContext.current
-    var currentDir by remember {
-        mutableStateOf(
-            if (initialDir.exists() && initialDir.isDirectory) initialDir
-            else android.os.Environment.getExternalStorageDirectory()
-        )
+    val initialDirectory = remember(initialDir) {
+        when {
+            initialDir.exists() && initialDir.isDirectory -> initialDir
+            initialDir.exists() && initialDir.isFile && initialDir.parentFile?.isDirectory == true -> initialDir.parentFile!!
+            else -> Environment.getExternalStorageDirectory()
+        }
     }
+    var currentDir by remember { mutableStateOf(initialDirectory) }
     var refreshTrigger by remember { mutableIntStateOf(0) }
     var showNewFolderInput by remember { mutableStateOf(false) }
     var newFolderName by remember { mutableStateOf("") }
 
-    val volumes = remember(context) { FileOperations.getStorageVolumes(context) }
+    fun hasStoragePerm(): Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Environment.isExternalStorageManager()
+    } else {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+    }
+
+    var hasStoragePermission by remember { mutableStateOf(hasStoragePerm()) }
+
+    val manageStorageLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        hasStoragePermission = hasStoragePerm()
+        refreshTrigger++
+    }
+
+    val legacyPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        hasStoragePermission = hasStoragePerm()
+        refreshTrigger++
+    }
+
+    val systemZipLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                var displayName = "source_archive.zip"
+                context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0) {
+                            cursor.getString(idx)?.takeIf { it.isNotBlank() }?.let { displayName = it }
+                        }
+                    }
+                }
+                if (!displayName.lowercase().endsWith(".zip")) {
+                    displayName = "$displayName.zip"
+                }
+                val cacheFolder = File(context.cacheDir, "github_zip_imports").apply { mkdirs() }
+                val destFile = File(cacheFolder, displayName)
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(destFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                if (destFile.exists() && destFile.length() > 0L) {
+                    onFolderSelected(destFile)
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    val volumes = remember(context, refreshTrigger) { FileOperations.getStorageVolumes(context) }
 
     val subFolders = remember(currentDir, refreshTrigger) {
         try {
             currentDir.listFiles()
                 ?.filter { it.isDirectory && it.canRead() }
+                ?.sortedBy { it.name.lowercase() }
+                ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    val zipFiles = remember(currentDir, refreshTrigger, showZipFiles) {
+        if (!showZipFiles) emptyList()
+        else try {
+            currentDir.listFiles()
+                ?.filter { it.isFile && it.canRead() && it.extension.equals("zip", ignoreCase = true) }
                 ?.sortedBy { it.name.lowercase() }
                 ?: emptyList()
         } catch (_: Exception) {
@@ -650,7 +733,7 @@ fun FolderPickerDialog(
             color = CharcoalSurface,
             modifier = Modifier
                 .fillMaxWidth(0.92f)
-                .fillMaxHeight(0.75f)
+                .fillMaxHeight(0.78f)
                 .widthIn(max = 520.dp)
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
@@ -675,6 +758,57 @@ fun FolderPickerDialog(
                     }
                     IconButton(onClick = { showNewFolderInput = !showNewFolderInput }) {
                         Icon(Icons.Default.CreateNewFolder, contentDescription = "Tạo thư mục mới", tint = Color(0xFFFFA000))
+                    }
+                }
+
+                // Storage permission prompt when not granted yet
+                if (!hasStoragePermission) {
+                    Surface(
+                        color = ColorWarningAmber.copy(alpha = 0.14f),
+                        border = BorderStroke(1.dp, ColorWarningAmber.copy(alpha = 0.45f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Security, contentDescription = null, tint = ColorWarningAmber, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Chưa có quyền đọc tất cả tệp .zip / thư mục.",
+                                color = TextPrimary,
+                                fontSize = 11.5.sp,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            TextButton(
+                                onClick = {
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                        try {
+                                            val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                                                data = Uri.parse("package:${context.packageName}")
+                                            }
+                                            manageStorageLauncher.launch(intent)
+                                        } catch (_: Exception) {
+                                            manageStorageLauncher.launch(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                                        }
+                                    } else {
+                                        legacyPermLauncher.launch(
+                                            arrayOf(
+                                                Manifest.permission.READ_EXTERNAL_STORAGE,
+                                                Manifest.permission.WRITE_EXTERNAL_STORAGE
+                                            )
+                                        )
+                                    }
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Text("Cấp quyền", color = ColorWarningAmber, fontWeight = FontWeight.Bold, fontSize = 11.5.sp)
+                            }
+                        }
                     }
                 }
 
@@ -742,7 +876,7 @@ fun FolderPickerDialog(
 
                 HorizontalDivider(color = DocumentsUIDivider)
 
-                // Folder List
+                // Folder & ZIP List
                 LazyColumn(
                     modifier = Modifier
                         .weight(1f)
@@ -768,7 +902,7 @@ fun FolderPickerDialog(
                         }
                     }
 
-                    if (subFolders.isEmpty()) {
+                    if (subFolders.isEmpty() && zipFiles.isEmpty()) {
                         item {
                             Box(
                                 modifier = Modifier
@@ -776,7 +910,11 @@ fun FolderPickerDialog(
                                     .padding(32.dp),
                                 contentAlignment = Alignment.Center
                             ) {
-                                Text("Không có thư mục con", color = TextMuted, fontSize = 13.sp)
+                                Text(
+                                    text = if (showZipFiles) "Không có thư mục con hoặc tệp .zip" else "Không có thư mục con",
+                                    color = TextMuted,
+                                    fontSize = 13.sp
+                                )
                             }
                         }
                     } else {
@@ -803,6 +941,52 @@ fun FolderPickerDialog(
                             }
                             HorizontalDivider(color = DocumentsUIDivider, thickness = 0.5.dp, modifier = Modifier.padding(start = 56.dp))
                         }
+
+                        items(zipFiles, key = { it.absolutePath }) { zipFile ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onFolderSelected(zipFile) }
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = ElectricBlue.copy(alpha = 0.2f),
+                                    border = BorderStroke(1.dp, CyanAccent.copy(alpha = 0.55f)),
+                                    modifier = Modifier.size(30.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            text = "ZIP",
+                                            color = CyanAccent,
+                                            fontSize = 9.5.sp,
+                                            fontWeight = FontWeight.ExtraBold
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = zipFile.name,
+                                        color = TextPrimary,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = "${FileItem.formatBytes(zipFile.length())} • Chạm để chọn tệp .zip này",
+                                        color = CyanAccent,
+                                        fontSize = 11.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Icon(Icons.Default.CheckCircleOutline, contentDescription = "Chọn tệp ZIP", tint = CyanAccent, modifier = Modifier.size(20.dp))
+                            }
+                            HorizontalDivider(color = DocumentsUIDivider, thickness = 0.5.dp, modifier = Modifier.padding(start = 56.dp))
+                        }
                     }
                 }
 
@@ -812,22 +996,39 @@ fun FolderPickerDialog(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 14.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.End,
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    TextButton(onClick = onDismiss) {
-                        Text("HUỶ", color = TextMuted, fontWeight = FontWeight.Bold)
+                    if (showZipFiles) {
+                        OutlinedButton(
+                            onClick = { systemZipLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) },
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, CyanAccent.copy(alpha = 0.6f)),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Icon(Icons.Default.FolderZip, null, tint = CyanAccent, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text("Chọn .ZIP hệ thống", color = CyanAccent, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    } else {
+                        Spacer(modifier = Modifier.width(1.dp))
                     }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Button(
-                        onClick = { onFolderSelected(currentDir) },
-                        colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = onDismiss) {
+                            Text("HUỶ", color = TextMuted, fontWeight = FontWeight.Bold)
+                        }
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("CHỌN THƯ MỤC NÀY", fontWeight = FontWeight.Bold)
+                        Button(
+                            onClick = { onFolderSelected(currentDir) },
+                            colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("CHỌN THƯ MỤC NÀY", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
                     }
                 }
             }

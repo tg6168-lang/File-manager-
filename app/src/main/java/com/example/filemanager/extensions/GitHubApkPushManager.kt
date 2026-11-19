@@ -10,7 +10,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
+import java.io.BufferedInputStream
 import java.io.File
+import java.io.FileInputStream
+import java.util.zip.ZipInputStream
 
 data class GitHubUserProfile(
     val login: String,
@@ -319,8 +322,8 @@ class GitHubApkPushManager(
             _state.value = _state.value.copy(lastPushError = err)
             return GitHubPushResult.Failure(err)
         }
-        if (!sourceDir.exists() || !sourceDir.isDirectory) {
-            val err = "Thư mục mã nguồn không tồn tại: ${sourceDir.absolutePath}"
+        if (!sourceDir.exists() || (!sourceDir.isDirectory && !sourceDir.extension.equals("zip", ignoreCase = true))) {
+            val err = "Thư mục hoặc tệp .zip mã nguồn không tồn tại hoặc không hợp lệ: ${sourceDir.absolutePath}"
             _state.value = _state.value.copy(lastPushError = err)
             return GitHubPushResult.Failure(err)
         }
@@ -379,10 +382,18 @@ class GitHubApkPushManager(
                 is ServiceCallResult.NetworkFailure -> return failPush(repoRes.message)
             }
 
-            // Step 3: Collect source files & ensure .github/workflows/android.yml exists
-            updateProgress(0.22f, "Đang quét 100% mã nguồn trong thư mục...")
+            // Step 3: Collect source files (from Directory or .ZIP) & ensure .github/workflows/android.yml exists
+            updateProgress(
+                0.22f,
+                if (sourceDir.isFile) "Đang giải nén & quét 100% mã nguồn từ tệp .zip..."
+                else "Đang quét 100% mã nguồn trong thư mục..."
+            )
             val entries = withContext(Dispatchers.IO) {
-                val collected = collectProjectFiles(sourceDir).toMutableList()
+                val collected = if (sourceDir.isFile && sourceDir.extension.equals("zip", ignoreCase = true)) {
+                    collectEntriesFromZip(sourceDir).toMutableList()
+                } else {
+                    collectProjectFiles(sourceDir).toMutableList()
+                }
                 val hasExistingWorkflow = collected.any {
                     it.relativePath.startsWith(".github/workflows/") &&
                         (it.relativePath.endsWith(".yml") || it.relativePath.endsWith(".yaml"))
@@ -400,7 +411,7 @@ class GitHubApkPushManager(
             }
 
             if (entries.isEmpty()) {
-                return failPush("Thư mục không có tệp nào hợp lệ để đẩy lên GitHub.")
+                return failPush("Nguồn đã chọn không chứa tệp mã nguồn hợp lệ nào để đẩy lên GitHub.")
             }
 
             // Step 4: Push code tree & commit via GitHubIntegrationService
@@ -618,10 +629,72 @@ class GitHubApkPushManager(
         return results
     }
 
+    private fun collectEntriesFromZip(zipFile: File): List<SourceCodeEntry> {
+        val rawEntries = mutableListOf<SourceCodeEntry>()
+        val ignoredSegments = setOf(".git", ".gradle", "build", ".idea", ".cxx", "node_modules", "__pycache__", ".dart_tool", "__MACOSX")
+        val maxFileSizeBytes = 8L * 1024L * 1024L
+
+        ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
+            val buffer = ByteArray(16 * 1024)
+            var entry = zis.nextEntry
+            while (entry != null && rawEntries.size < 800) {
+                if (!entry.isDirectory) {
+                    val normalizedPath = entry.name
+                        .replace('\\', '/')
+                        .trimStart('/')
+                    val segments = normalizedPath.split('/').filter { it.isNotBlank() }
+                    val hasIgnoredDir = segments.dropLast(1).any { it in ignoredSegments }
+                    if (segments.isNotEmpty() && !hasIgnoredDir && !normalizedPath.contains("..")) {
+                        val out = java.io.ByteArrayOutputStream()
+                        var total = 0L
+                        var exceeded = false
+                        while (true) {
+                            val read = zis.read(buffer)
+                            if (read <= 0) break
+                            total += read
+                            if (total > maxFileSizeBytes) {
+                                exceeded = true
+                                break
+                            }
+                            out.write(buffer, 0, read)
+                        }
+                        if (!exceeded) {
+                            val cleanRel = segments.joinToString("/")
+                            val fileName = segments.last()
+                            val isExec = fileName == "gradlew" || fileName.endsWith(".sh", ignoreCase = true)
+                            rawEntries.add(
+                                SourceCodeEntry(
+                                    relativePath = cleanRel,
+                                    bytes = out.toByteArray(),
+                                    executable = isExec
+                                )
+                            )
+                        }
+                    }
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+        }
+
+        // Unwrap redundant single top-level directory (e.g. "my-project-main/app/..." -> "app/...")
+        if (rawEntries.isNotEmpty()) {
+            val topSegments = rawEntries.mapNotNull { it.relativePath.substringBefore('/', missingDelimiterValue = "").takeIf { s -> s.isNotBlank() } }
+            if (topSegments.size == rawEntries.size) {
+                val commonRoot = topSegments.first()
+                if (commonRoot != ".github" && topSegments.all { it == commonRoot }) {
+                    val prefix = "$commonRoot/"
+                    return rawEntries.map { it.copy(relativePath = it.relativePath.removePrefix(prefix)) }
+                }
+            }
+        }
+        return rawEntries
+    }
+
     companion object {
         const val GITHUB_SIGN_IN_URL = "https://github.com/login"
         const val GITHUB_TOKEN_CREATE_URL =
-            "https://github.com/settings/tokens/new?scopes=repo,workflow&description=FileManagerPro-APK-Builder"
+            "https://github.com/settings/tokens/new?scopes=repo,workflow,write:packages,admin:repo_hook,user&description=FileManagerPro-APK-Builder"
 
         private val PREFIX_REGEX = Regex(
             pattern = "^(?:authorization\\s*:\\s*|bearer\\s+|token\\s+|oauth\\s+|git\\s+)+",
@@ -700,6 +773,10 @@ class GitHubApkPushManager(
                 branches: [ main, master ]
               workflow_dispatch:
 
+            permissions:
+              contents: write
+              actions: write
+
             jobs:
               build-apk:
                 runs-on: ubuntu-latest
@@ -713,13 +790,46 @@ class GitHubApkPushManager(
                       distribution: temurin
                       java-version: '17'
 
-                  - name: Grant execute permission for gradlew
-                    if: hashFiles('gradlew') != ''
-                    run: chmod +x gradlew
+                  - name: Set up Node.js (if Capacitor/Web project)
+                    if: hashFiles('package.json') != ''
+                    uses: actions/setup-node@v4
+                    with:
+                      node-version: '20'
 
-                  - name: Build Debug APK
+                  - name: Install & Sync Capacitor Android (if applicable)
+                    if: hashFiles('package.json') != '' && hashFiles('capacitor.config.*') != ''
+                    run: |
+                      npm install
+                      npm run build || true
+                      npx cap sync android || true
+
+                  - name: Grant execute permission for gradlew
+                    if: hashFiles('gradlew', 'android/gradlew') != ''
+                    run: |
+                      [ -f gradlew ] && chmod +x gradlew || true
+                      [ -f android/gradlew ] && chmod +x android/gradlew || true
+
+                  - name: Build Debug APK (Root Gradle)
                     if: hashFiles('gradlew') != ''
                     run: ./gradlew assembleDebug --no-daemon
+
+                  - name: Build Debug APK (Capacitor Android Subdir)
+                    if: hashFiles('gradlew') == '' && hashFiles('android/gradlew') != ''
+                    working-directory: android
+                    run: ./gradlew assembleDebug --no-daemon
+
+                  - name: Setup Gradle (Fallback when wrapper omitted)
+                    if: hashFiles('gradlew', 'android/gradlew') == '' && hashFiles('build.gradle*', 'android/build.gradle*') != ''
+                    uses: gradle/actions/setup-gradle@v4
+
+                  - name: Build Debug APK via System Gradle
+                    if: hashFiles('gradlew', 'android/gradlew') == '' && hashFiles('build.gradle*', 'android/build.gradle*') != ''
+                    run: |
+                      if [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+                        gradle assembleDebug --no-daemon
+                      elif [ -d android ]; then
+                        cd android && gradle assembleDebug --no-daemon
+                      fi
 
                   - name: Upload APK Artifact
                     uses: actions/upload-artifact@v4

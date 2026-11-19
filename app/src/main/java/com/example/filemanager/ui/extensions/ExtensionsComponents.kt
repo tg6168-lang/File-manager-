@@ -1,9 +1,17 @@
 package com.example.filemanager.ui.extensions
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
+import android.provider.OpenableColumns
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -15,6 +23,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.automirrored.filled.Launch
+import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -42,10 +51,12 @@ import com.example.filemanager.extensions.GitHubApkPushManager
 import com.example.filemanager.extensions.GitHubExtensionState
 import com.example.filemanager.extensions.GoogleAuthManager
 import com.example.filemanager.extensions.GoogleAuthUiState
+import com.example.filemanager.model.FileItem
 import com.example.filemanager.ui.archive.FolderPickerDialog
 import com.example.ui.theme.*
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.FileOutputStream
 
 private val VioletAccent = Color(0xFF7C4DFF)
 private val MagentaAccent = Color(0xFFA855F7)
@@ -208,29 +219,54 @@ fun GoogleAccountPortalCard(
                     )
                 }
             } else if (currentProfile == null) {
-                Button(
-                    onClick = { GoogleAuthManager.signInWithGoogle(context) },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = ElectricBlue,
-                        contentColor = Color.White
-                    ),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 48.dp)
-                        .testTag("google_sign_in_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Login,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Đăng nhập tài khoản Google",
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 13.sp
-                    )
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = { GoogleAuthManager.signInWithGoogle(context) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ElectricBlue,
+                            contentColor = Color.White
+                        ),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("google_sign_in_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Login,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Đăng nhập tài khoản Google",
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 13.sp
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = { GoogleAuthManager.signInWithGoogleWebOAuth(context) },
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, CharcoalSurfaceHighlight),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 44.dp)
+                            .testTag("google_web_oauth_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Launch,
+                            contentDescription = "Đăng nhập Google qua trình duyệt",
+                            tint = CyanAccent,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Đăng nhập Google qua trình duyệt (Dự phòng)",
+                            color = TextSecondary,
+                            fontSize = 12.sp
+                        )
+                    }
                 }
             } else {
                 Surface(
@@ -506,17 +542,86 @@ fun GitHubEnvSettingsDialog(
     var tokenInput by remember(state.verifiedToken) { mutableStateOf(state.verifiedToken) }
     var showTokenPlaintext by remember { mutableStateOf(false) }
     var repoNameInput by remember(state.savedRepoName) { mutableStateOf(state.savedRepoName) }
-    var selectedDir by remember(state.savedSourceDirPath) {
+    var selectedSource by remember(state.savedSourceDirPath) {
         mutableStateOf(
             state.savedSourceDirPath
                 .takeIf { it.isNotBlank() }
                 ?.let { File(it) }
-                ?.takeIf { it.exists() && it.isDirectory }
+                ?.takeIf { it.exists() && (it.isDirectory || it.extension.equals("zip", ignoreCase = true)) }
                 ?: defaultDirectory
         )
     }
     var isPrivateRepo by remember { mutableStateOf(false) }
     var showFolderPicker by remember { mutableStateOf(false) }
+
+    fun checkStoragePermission(): Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Environment.isExternalStorageManager()
+    } else {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+    }
+
+    var hasStoragePermission by remember { mutableStateOf(checkStoragePermission()) }
+
+    val manageStorageLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        hasStoragePermission = checkStoragePermission()
+    }
+
+    val legacyStoragePermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        hasStoragePermission = checkStoragePermission()
+    }
+
+    val onApplyChosenSource: (File) -> Unit = { chosen ->
+        selectedSource = chosen
+        val baseName = if (chosen.isFile && chosen.extension.equals("zip", ignoreCase = true)) {
+            chosen.nameWithoutExtension
+        } else {
+            chosen.name
+        }
+        val suggestedRepo = if (repoNameInput.isBlank() || repoNameInput == GitHubExtensionState.DEFAULT_REPO_NAME) {
+            GitHubApkPushManager.sanitizeRepoName(baseName)
+                .ifBlank { GitHubExtensionState.DEFAULT_REPO_NAME }
+        } else {
+            repoNameInput
+        }
+        repoNameInput = suggestedRepo
+        pushManager.updateRepoAndFolderPreferences(suggestedRepo, chosen.absolutePath)
+    }
+
+    val systemZipPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                var displayName = "source_archive.zip"
+                context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0) {
+                            cursor.getString(idx)?.takeIf { it.isNotBlank() }?.let { displayName = it }
+                        }
+                    }
+                }
+                if (!displayName.lowercase().endsWith(".zip")) {
+                    displayName = "$displayName.zip"
+                }
+                val cacheFolder = File(context.cacheDir, "github_zip_imports").apply { mkdirs() }
+                val destFile = File(cacheFolder, displayName)
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(destFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                if (destFile.exists() && destFile.length() > 0L) {
+                    onApplyChosenSource(destFile)
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -687,7 +792,7 @@ fun GitHubEnvSettingsDialog(
                                     }
 
                                     Text(
-                                        text = "1. Đăng nhập GitHub liên kết Google (nếu chưa đăng nhập) rồi tạo mã Token (đầu ghp_...).\n2. Dán mã vào ô Mã truy cập cá nhân GitHub và chọn thư mục mã nguồn — hệ thống sẽ tự tạo kho lưu trữ, đẩy 100% mã nguồn và kích hoạt GitHub Actions biên dịch .APK.",
+                                        text = "1. Đăng nhập GitHub rồi tạo mã Token đầy đủ quyền (repo, workflow, write:packages, admin:repo_hook, user — đầu ghp_...).\n2. Dán mã vào ô Mã truy cập cá nhân GitHub và chọn thư mục mã nguồn HOẶC tệp .ZIP — hệ thống sẽ tự tạo repo, đẩy 100% mã nguồn và kích hoạt GitHub Actions biên dịch .APK.",
                                         color = TextSecondary,
                                         fontSize = 12.sp,
                                         lineHeight = 17.sp
@@ -707,7 +812,7 @@ fun GitHubEnvSettingsDialog(
                                             modifier = Modifier.heightIn(min = 40.dp)
                                         ) {
                                             Icon(
-                                                imageVector = Icons.Default.Login,
+                                                imageVector = Icons.AutoMirrored.Filled.Login,
                                                 contentDescription = null,
                                                 tint = TextSecondary,
                                                 modifier = Modifier.size(14.dp)
@@ -727,7 +832,7 @@ fun GitHubEnvSettingsDialog(
                                                 .weight(1f)
                                         ) {
                                             Text(
-                                                text = "Lấy Token (đã chọn repo + workflow)",
+                                                text = "Lấy Token (đầy đủ quyền build APK)",
                                                 color = ColorWarningAmber,
                                                 fontSize = 11.5.sp,
                                                 fontWeight = FontWeight.SemiBold,
@@ -934,43 +1039,168 @@ fun GitHubEnvSettingsDialog(
 
                                     HorizontalDivider(color = CharcoalSurfaceHighlight)
 
-                                    // Source Folder Selector
-                                    Row(
+                                    // Storage Permission Banner if not yet granted
+                                    if (!hasStoragePermission) {
+                                        Surface(
+                                            color = ColorWarningAmber.copy(alpha = 0.14f),
+                                            shape = RoundedCornerShape(8.dp),
+                                            border = BorderStroke(1.dp, ColorWarningAmber.copy(alpha = 0.45f)),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Security,
+                                                    contentDescription = "Cấp quyền truy cập tệp",
+                                                    tint = ColorWarningAmber,
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Text(
+                                                    text = "Cần quyền đọc tất cả tệp để duyệt thư mục & tệp .zip trong bộ nhớ.",
+                                                    color = TextPrimary,
+                                                    fontSize = 11.sp,
+                                                    lineHeight = 15.sp,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                TextButton(
+                                                    onClick = {
+                                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                                            try {
+                                                                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                                                                    data = Uri.parse("package:${context.packageName}")
+                                                                }
+                                                                manageStorageLauncher.launch(intent)
+                                                            } catch (_: Exception) {
+                                                                manageStorageLauncher.launch(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                                                            }
+                                                        } else {
+                                                            legacyStoragePermLauncher.launch(
+                                                                arrayOf(
+                                                                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                                                                    Manifest.permission.WRITE_EXTERNAL_STORAGE
+                                                                )
+                                                            )
+                                                        }
+                                                    },
+                                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                                ) {
+                                                    Text("Cấp quyền", color = ColorWarningAmber, fontWeight = FontWeight.Bold, fontSize = 11.5.sp)
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Source Folder or .ZIP Selector
+                                    Column(
                                         modifier = Modifier.fillMaxWidth(),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.SpaceBetween
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
                                     ) {
-                                        Column(modifier = Modifier.weight(1f)) {
+                                        val isZipSelected = selectedSource.isFile && selectedSource.extension.equals("zip", ignoreCase = true)
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
                                             Text(
-                                                text = "Thư mục mã nguồn đẩy lên GitHub:",
+                                                text = "Nguồn mã nguồn đẩy lên GitHub:",
                                                 color = TextSecondary,
                                                 fontSize = 11.5.sp
                                             )
-                                            Text(
-                                                text = selectedDir.absolutePath,
-                                                color = TextPrimary,
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.Medium,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
+                                            Surface(
+                                                shape = RoundedCornerShape(6.dp),
+                                                color = if (isZipSelected) CyanAccent.copy(alpha = 0.16f) else ColorWarningAmber.copy(alpha = 0.16f),
+                                                border = BorderStroke(
+                                                    1.dp,
+                                                    if (isZipSelected) CyanAccent.copy(alpha = 0.45f) else ColorWarningAmber.copy(alpha = 0.45f)
+                                                )
+                                            ) {
+                                                Text(
+                                                    text = if (isZipSelected) {
+                                                        "Tệp ZIP • ${FileItem.formatBytes(selectedSource.length())}"
+                                                    } else {
+                                                        "Thư mục"
+                                                    },
+                                                    color = if (isZipSelected) CyanAccent else ColorWarningAmber,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                                                )
+                                            }
                                         }
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        OutlinedButton(
-                                            onClick = { showFolderPicker = true },
-                                            shape = RoundedCornerShape(8.dp),
-                                            border = BorderStroke(1.dp, CyanAccent.copy(alpha = 0.6f)),
-                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                                            modifier = Modifier.heightIn(min = 42.dp)
+
+                                        Text(
+                                            text = if (isZipSelected) {
+                                                "${selectedSource.name}\n${selectedSource.absolutePath}"
+                                            } else {
+                                                selectedSource.absolutePath
+                                            },
+                                            color = TextPrimary,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                                         ) {
-                                            Icon(
-                                                imageVector = Icons.Default.FolderOpen,
-                                                contentDescription = "Chọn thư mục mã nguồn",
-                                                tint = CyanAccent,
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(5.dp))
-                                            Text("Chọn thư mục", color = CyanAccent, fontSize = 11.5.sp)
+                                            OutlinedButton(
+                                                onClick = { showFolderPicker = true },
+                                                shape = RoundedCornerShape(8.dp),
+                                                border = BorderStroke(1.dp, CyanAccent.copy(alpha = 0.6f)),
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .heightIn(min = 44.dp)
+                                                    .testTag("github_pick_source_button")
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.FolderOpen,
+                                                    contentDescription = "Chọn thư mục hoặc tệp ZIP",
+                                                    tint = CyanAccent,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(5.dp))
+                                                Text(
+                                                    text = "Chọn thư mục / .ZIP",
+                                                    color = CyanAccent,
+                                                    fontSize = 11.5.sp,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+
+                                            OutlinedButton(
+                                                onClick = {
+                                                    systemZipPickerLauncher.launch(
+                                                        arrayOf(
+                                                            "application/zip",
+                                                            "application/x-zip-compressed",
+                                                            "application/octet-stream"
+                                                        )
+                                                    )
+                                                },
+                                                shape = RoundedCornerShape(8.dp),
+                                                border = BorderStroke(1.dp, VioletAccent.copy(alpha = 0.6f)),
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                                modifier = Modifier
+                                                    .heightIn(min = 44.dp)
+                                                    .testTag("github_pick_system_zip_button")
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.FolderZip,
+                                                    contentDescription = "Chọn tệp ZIP từ hệ thống",
+                                                    tint = MagentaAccent,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(5.dp))
+                                                Text("Chọn .ZIP", color = MagentaAccent, fontSize = 11.5.sp)
+                                            }
                                         }
                                     }
 
@@ -1025,7 +1255,7 @@ fun GitHubEnvSettingsDialog(
                                                 scope.launch {
                                                     pushManager.pushSourceAndBuildApk(
                                                         rawToken = tokenInput,
-                                                        sourceDir = selectedDir,
+                                                        sourceDir = selectedSource,
                                                         rawRepoName = repoNameInput,
                                                         isPrivate = isPrivateRepo
                                                     )
@@ -1201,19 +1431,12 @@ fun GitHubEnvSettingsDialog(
 
     if (showFolderPicker) {
         FolderPickerDialog(
-            title = "Chọn thư mục mã nguồn đẩy lên GitHub",
-            initialDir = selectedDir.takeIf { it.exists() } ?: Environment.getExternalStorageDirectory(),
+            title = "Chọn thư mục hoặc tệp .ZIP mã nguồn",
+            initialDir = selectedSource.takeIf { it.exists() } ?: Environment.getExternalStorageDirectory(),
+            showZipFiles = true,
             onDismiss = { showFolderPicker = false },
             onFolderSelected = { chosen ->
-                selectedDir = chosen
-                val suggestedRepo = if (repoNameInput.isBlank() || repoNameInput == GitHubExtensionState.DEFAULT_REPO_NAME) {
-                    GitHubApkPushManager.sanitizeRepoName(chosen.name)
-                        .ifBlank { GitHubExtensionState.DEFAULT_REPO_NAME }
-                } else {
-                    repoNameInput
-                }
-                repoNameInput = suggestedRepo
-                pushManager.updateRepoAndFolderPreferences(suggestedRepo, chosen.absolutePath)
+                onApplyChosenSource(chosen)
                 showFolderPicker = false
             }
         )

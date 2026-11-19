@@ -3,15 +3,20 @@ package com.example.filemanager.extensions
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.MutableContextWrapper
 import android.util.Log
 import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
+import androidx.credentials.exceptions.GetCredentialException
+import androidx.credentials.exceptions.GetCredentialProviderConfigurationException
+import androidx.credentials.exceptions.GetCredentialUnsupportedException
 import androidx.credentials.exceptions.NoCredentialException
 import com.example.R
 import com.google.android.gms.tasks.Task
+import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential.Companion.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
@@ -19,6 +24,7 @@ import com.google.firebase.Firebase
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.GoogleAuthProvider
+import com.google.firebase.auth.OAuthProvider
 import com.google.firebase.auth.auth
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -49,7 +55,9 @@ sealed interface GoogleAuthUiState {
 }
 
 /**
- * Optional Google Sign-In Portal powered by Firebase Authentication + Jetpack Credential Manager.
+ * Optional Google Sign-In Portal powered by Firebase Authentication + Jetpack Credential Manager,
+ * with automatic fallback to GetGoogleIdOption and Firebase Browser OAuth (OAuthProvider) so sign-in
+ * works reliably across real devices, custom ROMs, and emulators.
  * Offline File Manager functionality remains 100% available whether signed in or signed out.
  */
 object GoogleAuthManager {
@@ -79,6 +87,15 @@ object GoogleAuthManager {
     init {
         try {
             auth.addAuthStateListener(authListener)
+            // Recover any pending browser OAuth sign-in result if Activity was recreated
+            auth.pendingAuthResult?.addOnSuccessListener { res ->
+                val profile = (res.user ?: auth.currentUser)?.toProfile()
+                if (profile != null) {
+                    _authState.value = GoogleAuthUiState.SignedIn(profile)
+                }
+            }?.addOnFailureListener { exc ->
+                Log.w(TAG, "Pending OAuth result failed: ${exc.message}")
+            }
         } catch (e: Exception) {
             Log.w(TAG, "FirebaseAuth listener init notice: ${e.message}")
         }
@@ -100,10 +117,7 @@ object GoogleAuthManager {
             ""
         }
         if (serverClientId.isBlank() || serverClientId.contains("dummy", ignoreCase = true)) {
-            _authState.value = GoogleAuthUiState.Error(
-                message = "Thiếu cấu hình default_web_client_id trong google-services.json.",
-                previousProfile = auth.currentUser?.toProfile()
-            )
+            signInWithGoogleWebOAuth(activity)
             return
         }
 
@@ -113,12 +127,62 @@ object GoogleAuthManager {
         managerScope.launch {
             try {
                 val credentialManager = CredentialManager.create(activity)
+                val activityWrapper = MutableContextWrapper(activity)
+
+                // Step 1: Official interactive GetSignInWithGoogleOption (1 option per request)
                 val signInOption = GetSignInWithGoogleOption.Builder(serverClientId = serverClientId).build()
-                val request = GetCredentialRequest.Builder()
+                val primaryRequest = GetCredentialRequest.Builder()
                     .addCredentialOption(signInOption)
                     .build()
 
-                val response = credentialManager.getCredential(activity, request)
+                val response = try {
+                    credentialManager.getCredential(activityWrapper, primaryRequest)
+                } catch (e: GetCredentialCancellationException) {
+                    Log.w(TAG, "Google Sign-In flow cancelled or dismissed: ${e.message}", e)
+                    val rawMsg = e.message.orEmpty()
+                    // If Play Services returned a developer/config/GMS internal error wrapped in cancellation,
+                    // fall back seamlessly to Firebase Web OAuth; otherwise surface clear helper message.
+                    val looksLikeConfigError = rawMsg.contains("28444") ||
+                        rawMsg.contains("16:") ||
+                        rawMsg.contains("developer console", ignoreCase = true) ||
+                        rawMsg.contains("caller", ignoreCase = true)
+                    if (looksLikeConfigError) {
+                        launchFirebaseGoogleWebOAuth(activity, previousProfile)
+                    } else {
+                        _authState.value = GoogleAuthUiState.Error(
+                            message = "Đã đóng hộp thoại Google One-Tap. Nếu cửa sổ không hiển thị, hãy bấm \"Đăng nhập qua trình duyệt\".",
+                            previousProfile = previousProfile
+                        )
+                    }
+                    return@launch
+                } catch (primaryErr: GetCredentialException) {
+                    Log.w(TAG, "Primary GetSignInWithGoogleOption failed (${primaryErr::class.simpleName}): ${primaryErr.message}")
+                    // Step 2: Try GetGoogleIdOption(filterByAuthorizedAccounts = false) before Web OAuth
+                    try {
+                        val fallbackOption = GetGoogleIdOption.Builder()
+                            .setFilterByAuthorizedAccounts(false)
+                            .setServerClientId(serverClientId)
+                            .setAutoSelectEnabled(false)
+                            .build()
+                        val fallbackRequest = GetCredentialRequest.Builder()
+                            .addCredentialOption(fallbackOption)
+                            .build()
+                        credentialManager.getCredential(activityWrapper, fallbackRequest)
+                    } catch (cancelErr: GetCredentialCancellationException) {
+                        Log.w(TAG, "Fallback GetGoogleIdOption cancelled: ${cancelErr.message}")
+                        _authState.value = GoogleAuthUiState.Error(
+                            message = "Đã đóng hộp thoại Google. Bạn có thể thử lại hoặc dùng \"Đăng nhập qua trình duyệt\".",
+                            previousProfile = previousProfile
+                        )
+                        return@launch
+                    } catch (fallbackErr: Exception) {
+                        Log.w(TAG, "Credential Manager fallback failed (${fallbackErr::class.simpleName}): ${fallbackErr.message}; launching Web OAuth")
+                        // Step 3: Universal Firebase OAuth via Browser / Custom Tab
+                        launchFirebaseGoogleWebOAuth(activity, previousProfile)
+                        return@launch
+                    }
+                }
+
                 val cred = response.credential
                 if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
                     val googleToken = GoogleIdTokenCredential.createFrom(cred.data).idToken
@@ -131,30 +195,91 @@ object GoogleAuthManager {
                         GoogleAuthUiState.SignedOut
                     }
                 } else {
-                    _authState.value = GoogleAuthUiState.Error(
-                        message = "Loại thông tin xác thực không hợp lệ.",
-                        previousProfile = previousProfile
-                    )
+                    Log.w(TAG, "Unexpected credential type: ${cred::class.java.name}")
+                    launchFirebaseGoogleWebOAuth(activity, previousProfile)
                 }
-            } catch (e: GetCredentialCancellationException) {
-                Log.w(TAG, "Google Sign-In flow cancelled or dismissed: ${e.message}", e)
-                _authState.value = previousProfile?.let { GoogleAuthUiState.SignedIn(it) }
-                    ?: GoogleAuthUiState.SignedOut
-            } catch (e: NoCredentialException) {
-                Log.w(TAG, "No Google credential available on device: ${e.message}", e)
-                _authState.value = GoogleAuthUiState.Error(
-                    message = "Thiết bị chưa có tài khoản Google hoặc dịch vụ Google Play chưa sẵn sàng.",
-                    previousProfile = previousProfile
-                )
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: NoCredentialException) {
+                Log.w(TAG, "No Google credential on device: ${e.message}", e)
+                launchFirebaseGoogleWebOAuth(activity, previousProfile)
+            } catch (e: GetCredentialUnsupportedException) {
+                Log.w(TAG, "Credential Manager unsupported: ${e.message}", e)
+                launchFirebaseGoogleWebOAuth(activity, previousProfile)
+            } catch (e: GetCredentialProviderConfigurationException) {
+                Log.w(TAG, "Credential Provider configuration notice: ${e.message}", e)
+                launchFirebaseGoogleWebOAuth(activity, previousProfile)
             } catch (e: Exception) {
-                Log.w(TAG, "Google Sign-In notice: ${e.message}")
+                Log.w(TAG, "Google Sign-In failed: ${e.message}", e)
                 _authState.value = GoogleAuthUiState.Error(
-                    message = "Đăng nhập Google chưa thành công: ${e.localizedMessage ?: "Vui lòng thử lại."}",
+                    message = "Đăng nhập Google chưa thành công: ${e.localizedMessage ?: "Vui lòng thử 'Đăng nhập qua trình duyệt'."}",
                     previousProfile = previousProfile
                 )
             }
+        }
+    }
+
+    /**
+     * Opens Google OAuth login directly via Chrome Custom Tab / system browser through Firebase Auth.
+     * Works on all Android devices and emulators regardless of Google Play Services Credential Manager state.
+     */
+    fun signInWithGoogleWebOAuth(context: Context) {
+        val activity = context.findActivity()
+        if (activity == null) {
+            _authState.value = GoogleAuthUiState.Error(
+                message = "Không thể mở trình duyệt đăng nhập từ ngữ cảnh hiện tại.",
+                previousProfile = auth.currentUser?.toProfile()
+            )
+            return
+        }
+        val previousProfile = auth.currentUser?.toProfile()
+        _authState.value = GoogleAuthUiState.Loading("Đang mở trang đăng nhập Google an toàn...")
+        managerScope.launch {
+            launchFirebaseGoogleWebOAuth(activity, previousProfile)
+        }
+    }
+
+    private suspend fun launchFirebaseGoogleWebOAuth(
+        activity: Activity,
+        previousProfile: GoogleAccountProfile?
+    ) {
+        try {
+            _authState.value = GoogleAuthUiState.Loading("Đang kết nối cổng đăng nhập Google...")
+            val provider = OAuthProvider.newBuilder("google.com")
+                .setScopes(listOf("email", "profile"))
+                .addCustomParameter("prompt", "select_account")
+                .build()
+
+            val pending = auth.pendingAuthResult
+            val result = if (pending != null) {
+                pending.awaitTask()
+            } else {
+                auth.startActivityForSignInWithProvider(activity, provider).awaitTask()
+            }
+
+            val profile = (result.user ?: auth.currentUser)?.toProfile()
+            _authState.value = if (profile != null) {
+                GoogleAuthUiState.SignedIn(profile)
+            } else {
+                GoogleAuthUiState.SignedOut
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Web OAuth sign-in notice: ${e.message}", e)
+            val msg = e.localizedMessage.orEmpty()
+            val friendly = when {
+                msg.contains("canceled", ignoreCase = true) || msg.contains("cancelled", ignoreCase = true) ->
+                    "Bạn đã hủy đăng nhập Google."
+                msg.contains("network", ignoreCase = true) ->
+                    "Không có kết nối Internet để đăng nhập Google."
+                else ->
+                    "Không thể hoàn tất đăng nhập Google: ${msg.ifBlank { "Vui lòng kiểm tra kết nối mạng và thử lại." }}"
+            }
+            _authState.value = GoogleAuthUiState.Error(
+                message = friendly,
+                previousProfile = previousProfile
+            )
         }
     }
 
